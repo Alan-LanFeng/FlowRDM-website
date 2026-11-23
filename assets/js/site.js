@@ -1,11 +1,6 @@
-/* FlowRDM project page. No library.
-   - footage loads and plays only while it is in view; clips of one comparison run in step
-   - the live matching figure of the method section
-   - the charts, drawn at the width of their column
-   - the marker of the running head */
 (function () {
   "use strict";
-  var doc = document, root = doc.documentElement, win = window;
+  var doc = document, win = window;
   var $ = function (s, c) { return (c || doc).querySelector(s); };
   var $$ = function (s, c) { return Array.prototype.slice.call((c || doc).querySelectorAll(s)); };
   var NS = "http://www.w3.org/2000/svg";
@@ -15,74 +10,120 @@
     if (parent) parent.appendChild(n);
     return n;
   }
-  var reduce = !!(win.matchMedia && win.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  var state = { playing: !reduce };
-  var INK = "#141414", GRAPHITE = "#6b6b6b", RULE = "#c4c4c4", OURS = "#e76f51", OURS_INK = "#bf4a2c";
+  var INK = "#141414", GRAPHITE = "#6b6b6b", RULE = "#c4c4c4", OURS_INK = "#bf4a2c";
 
-  /* ------------------------------------------------------------ footage */
-  var vids = $$("video[data-src]"), groups = {};
-  vids.forEach(function (v) {
-    v.muted = true; v.defaultMuted = true; v.playsInline = true; v._vis = false;
-    var g = v.getAttribute("data-sync");
-    if (g) (groups[g] = groups[g] || { els: [], on: false }).els.push(v); else v.loop = true;
-  });
-  function load(v) {
-    if (v._loaded) return;
-    v._loaded = true; v.preload = "auto"; v.src = v.getAttribute("data-src");
+  /* A reader can play one experiment at a time. Within it, the comparison nearest
+     the centre of the viewport plays in sync; offscreen groups keep their place. */
+  var activeResult = null, activeGroup = null, started = false, frame = 0, generation = 0;
+  var filmVideo = $(".film video[data-film]");
+
+  function pauseGroup() {
+    generation++;
+    if (activeGroup) activeGroup.forEach(function (clip) { clip.pause(); });
+    activeGroup = null;
+    started = false;
   }
-  function play(v) {
-    var p = v.play();
-    if (p && p.catch) p.catch(function (err) {
-      /* the browser refused to start footage by itself (a power-saving mode, for example): hand the switch to the reader */
-      if (err && err.name === "NotAllowedError" && state.playing) { state.playing = false; paint(); vids.forEach(update); }
+  function stopResult(retry) {
+    pauseGroup();
+    if (activeResult) activeResult.button.textContent = (retry ? "Retry " : "Play ") + activeResult.label;
+    activeResult = null;
+  }
+  function playWhenReady() {
+    if (!activeGroup || started || !activeGroup.every(function (clip) { return clip.readyState >= 3; })) return;
+    started = true;
+    var time = activeGroup[0].currentTime, version = generation;
+    activeGroup.forEach(function (clip) {
+      if (Math.abs(clip.currentTime - time) > 0.05) clip.currentTime = time;
+      var promise = clip.play();
+      if (promise) promise.catch(function () { if (generation === version) stopResult(true); });
     });
   }
-  function startGroup(G) {
-    if (G.on) return;
-    G.on = true;
-    (function wait() {
-      if (!G.on) return;
-      if (G.els.every(function (e) { return e.readyState >= 3; })) {
-        var t = G.els[0].currentTime;
-        G.els.forEach(function (e, i) { if (i && Math.abs(e.currentTime - t) > 0.05) e.currentTime = t; play(e); });
-      } else setTimeout(wait, 120);
-    })();
-  }
-  function update(v) {
-    var g = v.getAttribute("data-sync"), active = state.playing && !doc.hidden;
-    if (!g) {
-      if (active && v._vis) { load(v); play(v); } else if (!v.paused) v.pause();
-      return;
+  function updateFootage() {
+    frame = 0;
+    if (!activeResult) return;
+    var nearest = null, distance = Infinity;
+    if (!doc.hidden && activeResult.detail.open) {
+      activeResult.groups.forEach(function (clips) {
+        clips.forEach(function (clip) {
+          var bounds = clip.getBoundingClientRect();
+          if (!bounds.height || bounds.bottom <= 0 || bounds.top >= win.innerHeight) return;
+          var d = Math.abs((bounds.top + bounds.bottom - win.innerHeight) / 2);
+          if (d < distance) { nearest = clips; distance = d; }
+        });
+      });
     }
-    var G = groups[g];
-    if (active && G.els.some(function (e) { return e._vis; })) { G.els.forEach(load); startGroup(G); }
-    else { G.on = false; G.els.forEach(function (e) { if (!e.paused) e.pause(); }); }
-  }
-  Object.keys(groups).forEach(function (k) {
-    var G = groups[k], lead = G.els[0];
-    lead.addEventListener("ended", function () {
-      if (!G.on) return;
-      G.els.forEach(function (e) { e.currentTime = 0; play(e); });
+    if (nearest === activeGroup) return;
+    pauseGroup();
+    activeGroup = nearest;
+    if (!nearest) return;
+    nearest.forEach(function (clip) {
+      if (!clip.hasAttribute("src") || clip.error) {
+        clip.preload = "auto";
+        clip.src = clip.dataset.src;
+      }
     });
-    lead.addEventListener("timeupdate", function () {
-      if (!G.on || lead.paused) return;
-      G.els.forEach(function (e, i) {
-        if (i && !e.seeking && e.readyState >= 2 && Math.abs(e.currentTime - lead.currentTime) > 0.14 && lead.currentTime < lead.duration - 0.3) e.currentTime = lead.currentTime;
+    playWhenReady();
+  }
+  function requestUpdate() {
+    if (activeResult && !frame) frame = win.requestAnimationFrame(updateFootage);
+  }
+  win.addEventListener("scroll", requestUpdate, { passive: true });
+  win.addEventListener("resize", requestUpdate);
+  doc.addEventListener("visibilitychange", updateFootage);
+  doc.addEventListener("toggle", requestUpdate, true);
+
+  $$("#results details.result").forEach(function (detail) {
+    var clips = $$("video[data-src]", detail);
+    if (!clips.length) return;
+    var groups = new Map();
+    clips.forEach(function (clip) {
+      var key = clip.dataset.sync || clip;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(clip);
+      clip.muted = true;
+      clip.playsInline = true;
+      clip.addEventListener("canplay", playWhenReady);
+      clip.addEventListener("error", function () {
+        if (groups.get(key) === activeGroup) stopResult(true);
       });
     });
+    groups.forEach(function (members) {
+      var lead = members[0];
+      lead.addEventListener("ended", function () {
+        if (activeGroup !== members) return;
+        members.forEach(function (clip) { clip.currentTime = 0; });
+        started = false;
+        playWhenReady();
+      });
+      lead.addEventListener("timeupdate", function () {
+        if (activeGroup !== members || lead.paused || lead.duration - lead.currentTime < 0.3) return;
+        members.slice(1).forEach(function (clip) {
+          if (clip.readyState >= 2 && !clip.seeking && Math.abs(clip.currentTime - lead.currentTime) > 0.14)
+            clip.currentTime = lead.currentTime;
+        });
+      });
+    });
+
+    var button = doc.createElement("button");
+    var result = { detail: detail, button: button, groups: groups,
+                   label: detail.id === "humanoid" ? "motion examples" : "comparison clips" };
+    button.type = "button";
+    button.className = "clip-toggle";
+    button.textContent = "Play " + result.label;
+    $(".block", detail).before(button);
+    button.addEventListener("click", function () {
+      var turningOff = activeResult === result;
+      stopResult(false);
+      if (turningOff) return;
+      if (filmVideo && !filmVideo.paused) filmVideo.pause();
+      activeResult = result;
+      button.textContent = "Pause " + result.label;
+      updateFootage();
+    });
+    detail.addEventListener("toggle", function () {
+      if (!detail.open && activeResult === result) stopResult(false);
+    });
   });
-  if ("IntersectionObserver" in win) {
-    var near = new IntersectionObserver(function (es) {
-      es.forEach(function (e) { if (e.isIntersecting) { load(e.target); near.unobserve(e.target); } });
-    }, { rootMargin: "700px 0px" });
-    var seen = new IntersectionObserver(function (es) {
-      es.forEach(function (e) { e.target._vis = e.isIntersecting; update(e.target); });
-    }, { rootMargin: "60px 0px", threshold: 0.01 });
-    vids.forEach(function (v) { seen.observe(v); if (state.playing) near.observe(v); });
-  } else {
-    vids.forEach(function (v) { v._vis = true; update(v); });
-  }
-  doc.addEventListener("visibilitychange", function () { vids.forEach(update); });
 
   /* a line or a mark on a clip that belongs to one moment of it: it shows once the clip has reached that second (and, with
      data-until, only up to that second), whether the clip plays or is paused. A clip that has not started shows its poster,
@@ -101,34 +142,23 @@
     v.addEventListener("playing", function () { if (!raf && win.requestAnimationFrame) raf = win.requestAnimationFrame(loop); });
   });
 
-  var motion = $(".mast__motion");
-  function paint() {
-    root.classList.toggle("is-paused", !state.playing);
-    if (!motion) return;
-    $(".mast__motion-t", motion).textContent = state.playing ? "Pause footage" : "Play footage";
-  }
-  if (motion) motion.addEventListener("click", function () {
-    state.playing = !state.playing;
-    paint();
-    vids.forEach(update);
-  });
-
   /* ------------------------------------------------------------ the film */
-  var film = $(".film");
-  if (film) {
-    var fv = $("video", film);
+  if (filmVideo) {
+    var film = filmVideo.closest(".film");
+    filmVideo.addEventListener("play", function () {
+      if (!filmVideo.paused) stopResult(false);
+    });
     var start = function () {
       if (film.classList.contains("is-playing")) return;
-      fv.src = fv.getAttribute("data-film");
-      fv.controls = true;
+      stopResult(false);
+      filmVideo.src = filmVideo.dataset.film;
+      filmVideo.controls = true;
       film.classList.add("is-playing");
-      var p = fv.play();
+      var p = filmVideo.play();
       if (p && p.catch) p.catch(function () {});
-      fv.focus({ preventScroll: true });
+      filmVideo.focus({ preventScroll: true });
     };
     film.addEventListener("click", start);
-    var go = $(".link--film");
-    if (go) go.addEventListener("click", start);
   }
 
   /* ------------------------------------------------------------ the matching figure
@@ -353,35 +383,38 @@
       }
     }
     draw();
-    if ("ResizeObserver" in win) new ResizeObserver(draw).observe(host); else win.addEventListener("resize", draw);
+    if ("ResizeObserver" in win) new ResizeObserver(draw).observe(host);
+    else {
+      win.addEventListener("resize", draw);
+      var detail = host.closest("details");
+      if (detail) detail.addEventListener("toggle", draw);
+    }
   }
   var DATA = (win.FLOWRDM && win.FLOWRDM.charts) || {};
   $$("[data-chart]").forEach(function (fig) { var sp = DATA[fig.getAttribute("data-chart")]; if (sp) lineChart(fig, sp); });
 
-  /* ------------------------------------------------------------ the marker of the running head */
-  var nav = $(".mast__nav"), mark = $(".mast__mark");
-  if (nav && mark) {
-    var links = $$("a", nav), secs = links.map(function (a) { return doc.getElementById(a.getAttribute("href").slice(1)); });
-    var cur = -2, tick = false;
-    var where = function () {
-      tick = false;
-      var line = win.innerHeight * 0.38, now = -1;
-      secs.forEach(function (s, i) { if (s && s.getBoundingClientRect().top <= line) now = i; });
-      if (now === cur) return;
-      cur = now;
-      links.forEach(function (a, i) { if (i === now) a.setAttribute("aria-current", "true"); else a.removeAttribute("aria-current"); });
-      if (now < 0) { mark.style.opacity = 0; return; }
-      var a = links[now];
-      mark.style.opacity = 1; mark.style.width = a.offsetWidth + "px"; mark.style.transform = "translateX(" + a.offsetLeft + "px)";
-      var want = a.offsetLeft - (nav.clientWidth - a.offsetWidth) / 2;
-      if (nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, want);
-    };
-    var ask = function () { if (!tick) { tick = true; win.requestAnimationFrame(where); } };
-    win.addEventListener("scroll", ask, { passive: true });
-    win.addEventListener("resize", function () { cur = -2; ask(); });
-    if (doc.fonts && doc.fonts.ready) doc.fonts.ready.then(function () { cur = -2; ask(); });
-    ask();
+  /* Reveal the target before the browser follows a same-page link. Opening a
+     result directly or revisiting it in browser history also reveals its content. */
+  function revealFragment(hash, scroll) {
+    if (!hash) return;
+    var id;
+    try { id = decodeURIComponent(hash.slice(1)); } catch (error) { return; }
+    var target = doc.getElementById(id);
+    if (!target) return;
+    var changed = false;
+    for (var parent = target; parent; parent = parent.parentElement) {
+      if (parent.tagName === "DETAILS" && !parent.open) { parent.open = true; changed = true; }
+    }
+    if (changed && scroll) target.scrollIntoView({ block: "start", behavior: "instant" });
   }
+  doc.addEventListener("click", function (event) {
+    if (event.defaultPrevented || event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    var link = event.target.closest("a[href^='#']");
+    if (link) revealFragment(link.hash, false);
+  });
+  function revealLocation() { revealFragment(win.location.hash, true); }
+  win.addEventListener("hashchange", revealLocation);
+  revealLocation();
 
   /* ------------------------------------------------------------ copy the BibTeX entry */
   $$("[data-copy]").forEach(function (b) {
@@ -392,5 +425,4 @@
     });
   });
 
-  paint();
 })();
